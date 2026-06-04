@@ -30,26 +30,19 @@ MODEL_FILE="${MODEL_DIR}/RealVisXL_V5.0_fp16.safetensors"
 WORKFLOW_DIR="${COMFYUI_DIR}/user/default/workflows"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 
-# Where to fetch heavy assets (model weights) from.
+# Where to fetch the checkpoint from.
 #
-# Resolution order, highest precedence first:
-#   1. YANDEX_MIRROR_URL  — explicit full URL override (set this for ad-hoc
-#                            testing against a staging file or a HuggingFace
-#                            mirror; wins outright when set)
-#   2. CC_TUTORIAL_MIRROR_URL — base URL of the customer app's configured
-#                            tutorials_mirror S3 bucket, exported by the
-#                            onstart wrapper. This is the production path:
-#                            the customer app always knows the correct
-#                            bucket because it generates URLs from the same
-#                            Storage::disk('tutorials_mirror') config used
-#                            elsewhere, so bucket renames can't break us.
-#   3. Hardcoded base URL — last-resort fallback for the local-test case
-#                            of running `bash provision.sh` inside a fresh
-#                            container with no customer-app env at all.
-#                            Must point at a real, currently-correct bucket
-#                            so manual tests succeed without env setup.
-CC_TUTORIAL_MIRROR_URL="${CC_TUTORIAL_MIRROR_URL:-https://storage.yandexcloud.net/cc-tutorials}"
-YANDEX_MIRROR_URL="${YANDEX_MIRROR_URL:-${CC_TUTORIAL_MIRROR_URL%/}/tutorials/comfyui-sdxl/RealVisXL_V5.0_fp16.safetensors}"
+# We download RealVisXL V5.0 straight from HuggingFace. It's a public, ungated
+# repo, so no token is needed. The customer app pins every tutorial instance to
+# a US/CA/EU geolocation whitelist (ApplicationsController::TUTORIAL_GEOLOCATION_WHITELIST
+# — RU/BY and CN/HK/MO are explicitly excluded), so the box always sits in an
+# HF-friendly region with fast CDN access. That makes self-hosting a 6.5 GB
+# mirror copy unnecessary: the russian-infrastructure caveat applies to our own
+# servers, not to the rented GPU host.
+#
+# MODEL_URL can be overridden (e.g. to point at a staging file or a private
+# mirror) for ad-hoc testing; it defaults to the HF resolve URL.
+MODEL_URL="${MODEL_URL:-https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors}"
 
 # Default workflow shipped alongside this script. The onstart wrapper only
 # fetches provision.sh, so we re-fetch workflow.json from this same repo at
@@ -128,7 +121,7 @@ else
         --timeout=120 \
         --progress=dot:giga \
         -O "${MODEL_FILE}.partial" \
-        "$YANDEX_MIRROR_URL" 2>&1 | \
+        "$MODEL_URL" 2>&1 | \
     while IFS= read -r line; do
         echo "$line"
         pct=$(echo "$line" | grep -oE '[0-9]+%' | tail -1 | tr -d '%' || true)
