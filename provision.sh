@@ -76,6 +76,65 @@ log() {
     echo "[cc-provision] $*"
 }
 
+CURRENT_STAGE=""
+
+# Vast tutorial hosts filter cuda_max_good >= 12.9 — drivers cap at CUDA 12.x.
+# ComfyUI's unpinned requirements.txt pulls torch 2.12+ (built for CUDA 13+),
+# which crashes on these boxes. Pin cu128 wheels after requirements.txt and
+# re-pin after custom setup scripts (customer pip may upgrade torch again).
+PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+
+send_log_tail() {
+    if [ -z "$CC_PROVISION_URL" ] || [ -z "$CC_AGENT_TOKEN" ]; then return 0; fi
+    local encoded
+    encoded="$(tail -n 200 /var/log/cc-provision.log 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' \
+        2>/dev/null)" || return 0
+    [ -z "$encoded" ] && return 0
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"log_tail\":${encoded}}"
+}
+
+send_app_log_tail() {
+    if [ -z "$CC_PROVISION_URL" ] || [ -z "$CC_AGENT_TOKEN" ]; then return 0; fi
+    local encoded
+    encoded="$(tail -n 200 /var/log/comfyui.log 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' \
+        2>/dev/null)" || return 0
+    [ -z "$encoded" ] && return 0
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"app_log_tail\":${encoded}}"
+}
+
+install_pinned_pytorch() {
+    log "pinning PyTorch to cu128 (Vast CUDA 12.x hosts)"
+    pip install --no-cache-dir --force-reinstall \
+        torch torchvision torchaudio \
+        --index-url "$PYTORCH_INDEX_URL"
+}
+
+verify_pytorch_cuda() {
+    log "verifying PyTorch CUDA"
+    set +e
+    cuda_out="$(python3 - <<'PY' 2>&1
+import sys
+import torch
+print(f"torch={torch.__version__} cuda={torch.version.cuda}", flush=True)
+if not torch.cuda.is_available():
+    sys.exit(1)
+print(torch.cuda.get_device_name(0), flush=True)
+PY
+)"
+    cuda_rc=$?
+    set -e
+    log "$cuda_out"
+    if [ "$cuda_rc" -ne 0 ]; then
+        driver_info="$(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        safe_msg="PyTorch CUDA unavailable (${driver_info:-unknown driver/GPU}). Pick another GPU offer — this host may have a broken NVIDIA container stack."
+        send_log_tail
+        report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"message\":\"${safe_msg}\"}"
+        exit 1
+    fi
+}
+
 # run_user_hook <stage-id>
 #
 # Runs the customer-supplied setup script, if any. MUST be called AFTER our
@@ -91,7 +150,7 @@ run_user_hook() {
     [ -n "${CC_USER_SETUP_B64:-}" ] || return 0
     _stage="${1:-start_server}"
     log "running custom setup script"
-    report_stage "{\"stage\":\"${_stage}\",\"message\":\"running custom setup script\"}"
+    report_stage "{\"stage\":\"${_stage}\",\"log_line\":\"running custom setup script\"}"
     if ! printf '%s' "$CC_USER_SETUP_B64" | base64 -d > /tmp/cc-user-setup.sh 2>/dev/null; then
         log "could not decode CC_USER_SETUP_B64; skipping custom setup"
         return 0
@@ -111,6 +170,7 @@ run_user_hook() {
 
 # --- stage 1: install_comfyui --------------------------------------------
 
+CURRENT_STAGE="install_comfyui"
 log "stage: install_comfyui"
 report_stage '{"stage":"install_comfyui"}'
 
@@ -120,6 +180,7 @@ if [ ! -d "$COMFYUI_DIR/.git" ]; then
 fi
 cd "$COMFYUI_DIR"
 pip install --no-cache-dir -r requirements.txt
+install_pinned_pytorch
 
 # ComfyUI Manager: in-UI installer for custom nodes and missing models.
 # Without this preinstalled, the first workflow a user opens that needs a
@@ -132,9 +193,12 @@ pip install --no-cache-dir -r requirements.txt
 pip install --no-cache-dir -U --pre comfyui-manager
 
 mkdir -p "$MODEL_DIR" "$WORKFLOW_DIR"
+verify_pytorch_cuda
+send_log_tail
 
 # --- stage 2: download_model ---------------------------------------------
 
+CURRENT_STAGE="download_model"
 log "stage: download_model"
 report_stage '{"stage":"download_model","progress_pct":0}'
 
@@ -192,6 +256,7 @@ fi
 
 # --- stage 3: start_server -----------------------------------------------
 
+CURRENT_STAGE="start_server"
 log "stage: start_server"
 report_stage '{"stage":"start_server"}'
 
@@ -199,6 +264,8 @@ report_stage '{"stage":"start_server"}'
 # is not up yet, so any custom_nodes the script clones are picked up on the
 # single boot below.
 run_user_hook "start_server"
+install_pinned_pytorch
+verify_pytorch_cuda
 
 cd "$COMFYUI_DIR"
 # --enable-manager: activates the ComfyUI Manager pip package installed
@@ -219,6 +286,8 @@ COMFYUI_PID=$!
 COMFYUI_BIND_TIMEOUT_S=90
 for _ in $(seq 1 "$COMFYUI_BIND_TIMEOUT_S"); do
     if curl -fsS --max-time 1 "http://127.0.0.1:${COMFYUI_PORT}/" >/dev/null 2>&1; then
+        send_log_tail
+        send_app_log_tail
         report_stage "{\"stage\":\"start_server\",\"progress_pct\":100}"
         log "provisioning complete"
         exit 0
@@ -230,6 +299,8 @@ for _ in $(seq 1 "$COMFYUI_BIND_TIMEOUT_S"); do
         # JSON body cap is generous (~5s curl timeout) but messages still
         # have to fit in one POST, so truncate to 500 chars.
         tail_msg="$(tail -c 500 /var/log/comfyui.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        send_log_tail
+        send_app_log_tail
         report_stage "{\"stage\":\"start_server\",\"message\":\"ComfyUI crashed during startup: ${tail_msg}\"}"
         exit 1
     fi
